@@ -17,7 +17,7 @@ lock = Lock()
 def get_items_list(session, cdn_list, url, retries, extensions, only_export, custom_path=None):
     print(f"[DEBUG] Fetching items list from URL: {url}")
     extensions_list = extensions.split(',') if extensions is not None else []
-       
+
     r = session.get(url)
     if r.status_code != 200:
         raise Exception(f"[-] HTTP error {r.status_code}")
@@ -26,7 +26,7 @@ def get_items_list(session, cdn_list, url, retries, extensions, only_export, cus
     is_bunkr = "| Bunkr" in soup.find('title').text
 
     direct_link = False
-    
+
     if is_bunkr:
         print(f"[DEBUG] Detected Bunkr site")
         items = []
@@ -46,7 +46,7 @@ def get_items_list(session, cdn_list, url, retries, extensions, only_export, cus
             boxes = soup.find_all('a', {'class': 'grid-images_box-link'})
             for box in boxes:
                 items.append({'url': box['href'], 'size': -1})
-            
+
             album_name = soup.find('h1', {'class': 'text-[24px]'}).text
             album_name = remove_illegal_chars(album_name[:album_name.index('\n')] if album_name.index('\n') > 0 else album_name)
     else:
@@ -60,6 +60,7 @@ def get_items_list(session, cdn_list, url, retries, extensions, only_export, cus
     download_path = get_and_prepare_download_path(custom_path, album_name)
     already_downloaded_url = get_already_downloaded_url(download_path)
 
+    item_queue = Queue()
     for item in items:
         if not direct_link:
             item = get_real_download_url(session, cdn_list, item['url'], is_bunkr)
@@ -72,21 +73,27 @@ def get_items_list(session, cdn_list, url, retries, extensions, only_export, cus
             if only_export:
                 write_url_to_list(item['url'], download_path)
             else:
-                for i in range(1, retries + 1):
-                    try:
-                        print(f"\t[+] Downloading {item['url']} (try {i}/{retries})")
-                        download(session, item['url'], download_path, is_bunkr, item['name'] if not is_bunkr else None)
-                        break
-                    except requests.exceptions.ConnectionError as e:
-                        if i < retries:
-                            time.sleep(2)
-                            pass
-                        else:
-                            raise e
+                item_queue.put((session, item['url'], download_path, is_bunkr, item['name'] if not is_bunkr else None, retries))
+
+    # Start worker threads to process the queue
+    threads = []
+    for i in range(4):  # You can adjust the number of threads
+        t = Thread(target=worker, args=(item_queue,))
+        t.start()
+        threads.append(t)
+
+    # Wait for all tasks to be completed
+    item_queue.join()
+
+    # Stop workers
+    for i in range(4):
+        item_queue.put(None)
+    for t in threads:
+        t.join()
 
     print(f"\t[+] File list exported in {os.path.join(download_path, 'url_list.txt')}" if only_export else f"\t[+] Download completed")
     return
-    
+
 def get_real_download_url(session, cdn_list, url, is_bunkr=True):
     print(f"[DEBUG] Getting real download URL for: {url}")
 
@@ -99,7 +106,7 @@ def get_real_download_url(session, cdn_list, url, is_bunkr=True):
     if r.status_code != 200:
         print(f"\t[-] HTTP error {r.status_code} getting real url for {url}")
         return None
-        
+
     if is_bunkr:
         soup = BeautifulSoup(r.content, 'html.parser')
         source_dom = soup.find('source')
@@ -127,7 +134,7 @@ def get_cdn_file_url(session, cdn_list, gallery_url, file_name=None):
     if cdn_list is None:
         print(f"\t[-] CDN list is empty unable to download {gallery_url}")
         return None
-       
+
     for cdn in cdn_list:
         if file_name is None:
             url_to_test = f"https://{cdn}/{gallery_url[gallery_url.index('/d/')+3:]}"
@@ -144,30 +151,38 @@ def get_cdn_file_url(session, cdn_list, gallery_url, file_name=None):
         else:
             print(f"\t\t[-] HTTP Error {r.status_code} for {gallery_url}, skipping")
             return None
-        
+
     return None
 
-
-def download(session, item_url, download_path, is_bunkr=False, file_name=None):
+def download(session, item_url, download_path, is_bunkr=False, file_name=None, retries=10):
     print(f"[DEBUG] Starting download for: {item_url}")
 
     file_name = get_url_data(item_url)['file_name'] if file_name is None else file_name
     final_path = os.path.join(download_path, file_name)
 
-    with session.get(item_url, stream=True, timeout=5) as r:
-        if r.status_code != 200:
-            print(f"\t[-] Error downloading \"{file_name}\": {r.status_code}")
-            return
-        if r.url == "https://bnkr.b-cdn.net/maintenance.mp4":
-            print(f"\t[-] Error downloading \"{file_name}\": Server is down for maintenance")
+    for attempt in range(1, retries + 1):
+        try:
+            with session.get(item_url, stream=True, timeout=5) as r:
+                if r.status_code != 200:
+                    print(f"\t[-] Error downloading \"{file_name}\": {r.status_code}")
+                    return
+                if r.url == "https://bnkr.b-cdn.net/maintenance.mp4":
+                    print(f"\t[-] Error downloading \"{file_name}\": Server is down for maintenance")
 
-        file_size = int(r.headers.get('content-length', -1))
-        with open(final_path, 'wb') as f:
-            with tqdm(total=file_size, unit='iB', unit_scale=True, desc=file_name, leave=False) as pbar:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk is not None:
-                        f.write(chunk)
-                        pbar.update(len(chunk))
+                file_size = int(r.headers.get('content-length', -1))
+                with open(final_path, 'wb') as f:
+                    with tqdm(total=file_size, unit='iB', unit_scale=True, desc=file_name, leave=False) as pbar:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk is not None:
+                                f.write(chunk)
+                                pbar.update(len(chunk))
+            break
+        except requests.exceptions.ConnectionError as e:
+            print(f"[DEBUG] ConnectionError during download attempt {attempt} for {item_url}: {e}")
+            if attempt < retries:
+                time.sleep(2)
+            else:
+                raise e
 
     if is_bunkr and file_size > -1:
         downloaded_file_size = os.stat(final_path).st_size
@@ -176,8 +191,6 @@ def download(session, item_url, download_path, is_bunkr=False, file_name=None):
             return
 
     mark_as_downloaded(item_url, download_path)
-
-    return
 
 def create_session():
     print(f"[DEBUG] Creating session")
@@ -226,7 +239,7 @@ def get_already_downloaded_url(download_path):
 
     if not os.path.isfile(file_path):
         return []
-    
+
     with open(file_path, 'r', encoding='utf-8') as f:
         return f.read().splitlines()
 
@@ -245,7 +258,7 @@ def get_cdn_list(session):
     if r.status_code != 200:
         print(f"[-] HTTP Error {r.status_code} while getting cdn list")
         return None
-    
+
     cdn_ret = []
     soup = BeautifulSoup(r.content, 'html.parser')
     cdn_list = soup.find_all('h2')
@@ -266,12 +279,13 @@ def process_url(session, cdn_list, url, retries, extensions, only_export, custom
     except Exception as e:
         print(f"\t[-] Error processing \"{url}\": {e}")
 
-def worker(queue, session, cdn_list, retries, extensions, only_export, custom_path):
+def worker(queue):
     while True:
-        url = queue.get()
-        if url is None:
+        item = queue.get()
+        if item is None:
             break
-        process_url(session, cdn_list, url, retries, extensions, only_export, custom_path)
+        session, item_url, download_path, is_bunkr, file_name, retries = item
+        download(session, item_url, download_path, is_bunkr, file_name, retries)
         queue.task_done()
 
 if __name__ == '__main__':
@@ -298,31 +312,13 @@ if __name__ == '__main__':
     session = create_session()
     cdn_list = get_cdn_list(session)
 
-    url_queue = Queue()
-
-    # Start worker threads
-    threads = []
-    for i in range(args.t):
-        t = Thread(target=worker, args=(url_queue, session, cdn_list, args.r, args.e, args.w, args.p))
-        t.start()
-        threads.append(t)
-
     if args.f is not None:
         with open(args.f, 'r', encoding='utf-8') as f:
             urls = f.read().splitlines()
         for url in urls:
-            url_queue.put(url)
+            process_url(session, cdn_list, url, args.r, args.e, args.w, args.p)
     else:
-        url_queue.put(args.u)
-
-    # Block until all tasks are done
-    url_queue.join()
-
-    # Stop workers
-    for i in range(args.t):
-        url_queue.put(None)
-    for t in threads:
-        t.join()
+        process_url(session, cdn_list, args.u, args.r, args.e, args.w, args.p)
 
     print("\t[+] All downloads completed")
     sys.exit(0)

@@ -2,3 +2,6 @@ requests
 bs4
 argparse
 tqdm
+Pillow
+opencv-python
+imagehash
