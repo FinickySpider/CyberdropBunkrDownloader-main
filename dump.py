@@ -8,11 +8,31 @@ import re
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 from tqdm import tqdm
-from threading import Thread, Lock
+from threading import Thread, Lock, Event
 from queue import Queue
 
 # Define global lock for thread safety
 lock = Lock()
+
+# Rate limit configuration
+INITIAL_DELAY = 1  # Initial delay in seconds between requests
+MAX_THREADS = 8  # Maximum number of threads for downloading
+RATE_LIMIT_WEIGHT = 0  # Initial weight
+MAX_RATE_LIMIT_WEIGHT = 10  # Maximum weight before reducing threads
+DECREASE_WEIGHT_RATE = 0.1  # Rate at which the weight decreases over time
+
+# Thread safe variables
+current_delay = INITIAL_DELAY
+active_threads = MAX_THREADS
+stop_event = Event()
+
+# Set to track currently downloading files
+currently_downloading = set()
+
+def rate_limited_request(session, url):
+    global current_delay
+    time.sleep(current_delay)  # Enforce delay between requests
+    return session.get(url)
 
 def get_items_list(session, cdn_list, url, retries, extensions, only_export, custom_path=None):
     print(f"[DEBUG] Fetching items list from URL: {url}")
@@ -60,39 +80,72 @@ def get_items_list(session, cdn_list, url, retries, extensions, only_export, cus
     download_path = get_and_prepare_download_path(custom_path, album_name)
     already_downloaded_url = get_already_downloaded_url(download_path)
 
+    real_url_queue = Queue()
     item_queue = Queue()
     for item in items:
         if not direct_link:
-            item = get_real_download_url(session, cdn_list, item['url'], is_bunkr)
-            if item is None:
-                print(f"\t\t[-] Unable to find a download link")
-                continue
+            real_url_queue.put((session, cdn_list, item['url'], is_bunkr))
+        else:
+            item_queue.put((session, item['url'], download_path, is_bunkr, item['name'], retries))
 
-        extension = get_url_data(item['url'])['extension']
-        if ((extension in extensions_list or len(extensions_list) == 0) and (item['url'] not in already_downloaded_url)):
-            if only_export:
-                write_url_to_list(item['url'], download_path)
-            else:
-                item_queue.put((session, item['url'], download_path, is_bunkr, item['name'] if not is_bunkr else None, retries))
+    # Start worker threads to fetch real download URLs
+    fetch_threads = []
+    for i in range(8):  # Adjust the number of threads based on your needs
+        t = Thread(target=fetch_real_download_urls, args=(real_url_queue, item_queue, extensions_list, already_downloaded_url, only_export, download_path, retries))
+        t.start()
+        fetch_threads.append(t)
+
+    # Wait for all real URL fetch tasks to be completed
+    real_url_queue.join()
+
+    # Stop fetch workers
+    for i in range(8):
+        real_url_queue.put(None)
+    for t in fetch_threads:
+        t.join()
 
     # Start worker threads to process the queue
-    threads = []
-    for i in range(4):  # You can adjust the number of threads
+    download_threads = []
+    for i in range(MAX_THREADS):  # Adjust the number of threads based on your needs
         t = Thread(target=worker, args=(item_queue,))
         t.start()
-        threads.append(t)
+        download_threads.append(t)
 
-    # Wait for all tasks to be completed
+    # Start thread to manage rate limiting dynamically
+    rate_manager_thread = Thread(target=rate_limit_manager, args=(item_queue,))
+    rate_manager_thread.start()
+
+    # Wait for all download tasks to be completed
     item_queue.join()
 
-    # Stop workers
-    for i in range(4):
+    # Stop download workers
+    for i in range(MAX_THREADS):
         item_queue.put(None)
-    for t in threads:
+    for t in download_threads:
         t.join()
+
+    # Stop rate limit manager
+    stop_event.set()
+    rate_manager_thread.join()
 
     print(f"\t[+] File list exported in {os.path.join(download_path, 'url_list.txt')}" if only_export else f"\t[+] Download completed")
     return
+
+def fetch_real_download_urls(real_url_queue, item_queue, extensions_list, already_downloaded_url, only_export, download_path, retries):
+    while True:
+        item = real_url_queue.get()
+        if item is None:
+            break
+        session, cdn_list, url, is_bunkr = item
+        real_url = get_real_download_url(session, cdn_list, url, is_bunkr)
+        if real_url:
+            extension = get_url_data(real_url['url'])['extension']
+            if (extension in extensions_list or len(extensions_list) == 0) and (real_url['url'] not in already_downloaded_url):
+                if only_export:
+                    write_url_to_list(real_url['url'], download_path)
+                else:
+                    item_queue.put((session, real_url['url'], download_path, is_bunkr, real_url.get('name'), retries))
+        real_url_queue.task_done()
 
 def get_real_download_url(session, cdn_list, url, is_bunkr=True):
     print(f"[DEBUG] Getting real download URL for: {url}")
@@ -100,9 +153,9 @@ def get_real_download_url(session, cdn_list, url, is_bunkr=True):
     if is_bunkr:
         url = url if 'https' in url else f'https://bunkr.sk{url}'
     else:
-        url = url.replace('/f/','/api/f/')
+        url = url.replace('/f/', '/api/f/')
 
-    r = session.get(url)
+    r = rate_limited_request(session, url)
     if r.status_code != 200:
         print(f"\t[-] HTTP error {r.status_code} getting real url for {url}")
         return None
@@ -111,7 +164,7 @@ def get_real_download_url(session, cdn_list, url, is_bunkr=True):
         soup = BeautifulSoup(r.content, 'html.parser')
         source_dom = soup.find('source')
         images_dom = soup.find_all('img')
-        links = soup.find_all('a',{'class': 'rounded-[5px]'})
+        links = soup.find_all('a', {'class': 'rounded-[5px]'})
 
         if source_dom is not None:
             return {'url': source_dom['src'], 'size': -1}
@@ -140,7 +193,7 @@ def get_cdn_file_url(session, cdn_list, gallery_url, file_name=None):
             url_to_test = f"https://{cdn}/{gallery_url[gallery_url.index('/d/')+3:]}"
         else:
             url_to_test = f"https://{cdn}/{file_name}"
-        r = session.get(url_to_test)
+        r = rate_limited_request(session, url_to_test)
         if r.status_code == 200:
             return url_to_test
         elif r.status_code == 404:
@@ -154,20 +207,29 @@ def get_cdn_file_url(session, cdn_list, gallery_url, file_name=None):
 
     return None
 
-def download(session, item_url, download_path, is_bunkr=False, file_name=None, retries=10):
+def download(session, item_url, download_path, is_bunkr=False, file_name=None, retries=10, backoff_factor=1):
+    global RATE_LIMIT_WEIGHT, current_delay, active_threads
     print(f"[DEBUG] Starting download for: {item_url}")
 
     file_name = get_url_data(item_url)['file_name'] if file_name is None else file_name
     final_path = os.path.join(download_path, file_name)
 
+    file_size = -1  # Initialize file_size
     for attempt in range(1, retries + 1):
         try:
             with session.get(item_url, stream=True, timeout=5) as r:
+                if r.status_code == 429:
+                    print(f"[-] Error downloading \"{file_name}\": {r.status_code} Too Many Requests")
+                    with lock:
+                        RATE_LIMIT_WEIGHT += 1
+                    time.sleep(backoff_factor * attempt)
+                    continue
                 if r.status_code != 200:
                     print(f"\t[-] Error downloading \"{file_name}\": {r.status_code}")
                     return
                 if r.url == "https://bnkr.b-cdn.net/maintenance.mp4":
                     print(f"\t[-] Error downloading \"{file_name}\": Server is down for maintenance")
+                    return
 
                 file_size = int(r.headers.get('content-length', -1))
                 with open(final_path, 'wb') as f:
@@ -176,12 +238,17 @@ def download(session, item_url, download_path, is_bunkr=False, file_name=None, r
                             if chunk is not None:
                                 f.write(chunk)
                                 pbar.update(len(chunk))
+            with lock:
+                RATE_LIMIT_WEIGHT = max(0, RATE_LIMIT_WEIGHT - 1)  # Decrease weight after a successful download
+                currently_downloading.discard(item_url)  # Mark file as no longer being downloaded
             break
         except requests.exceptions.ConnectionError as e:
             print(f"[DEBUG] ConnectionError during download attempt {attempt} for {item_url}: {e}")
             if attempt < retries:
                 time.sleep(2)
             else:
+                with lock:
+                    currently_downloading.discard(item_url)  # Mark file as no longer being downloaded
                 raise e
 
     if is_bunkr and file_size > -1:
@@ -191,6 +258,18 @@ def download(session, item_url, download_path, is_bunkr=False, file_name=None, r
             return
 
     mark_as_downloaded(item_url, download_path)
+
+def rate_limit_manager(queue):
+    global current_delay, active_threads
+    while not stop_event.is_set():
+        with lock:
+            if RATE_LIMIT_WEIGHT >= MAX_RATE_LIMIT_WEIGHT:
+                current_delay += 0.5  # Increase delay
+                active_threads = max(1, active_threads - 1)  # Decrease threads
+            elif RATE_LIMIT_WEIGHT == 0:
+                current_delay = max(INITIAL_DELAY, current_delay - 0.5)  # Decrease delay
+                active_threads = min(MAX_THREADS, active_threads + 1)  # Increase threads
+        time.sleep(1)  # Adjust based on the desired frequency of checks
 
 def create_session():
     print(f"[DEBUG] Creating session")
@@ -285,6 +364,11 @@ def worker(queue):
         if item is None:
             break
         session, item_url, download_path, is_bunkr, file_name, retries = item
+        with lock:
+            if item_url in currently_downloading:
+                queue.task_done()
+                continue
+            currently_downloading.add(item_url)
         download(session, item_url, download_path, is_bunkr, file_name, retries)
         queue.task_done()
 
